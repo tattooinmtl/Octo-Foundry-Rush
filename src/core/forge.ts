@@ -1,11 +1,12 @@
 /**
  * AI tower forge.
  *
- * The Node server owns the MiniMax call (so the API key never reaches the
- * browser) and enforces the uniqueness rules: a forged tower must use a
- * damage type, projectile style and colour that no earlier tower used.
- * This module validates the answer and falls back to a local procedural
- * generator if the server cannot be reached, so the game never dead-ends.
+ * The Node server owns the provider call (MiniMax, NVIDIA, Reflection, Agnes
+ * or a custom endpoint) and enforces the uniqueness rules: a forged tower
+ * must use a damage type, projectile style and colour that no earlier tower
+ * used. This module validates the answer, times out a stuck request, and
+ * falls back to a local procedural generator if the server cannot help, so
+ * the game never dead-ends.
  */
 
 import { AI_EFFECTS, PROJECTILE_SHAPES, type EffectId, type TowerSpec } from './towerDefs';
@@ -25,7 +26,19 @@ export interface ForgeOptions {
   signal?: AbortSignal;
   /** What the player asked the forge to build. */
   brief?: string;
+  /** Provider id (shared/providers.mjs) or 'custom'. */
+  provider?: string;
+  /** Short name used in error messages ("MINIMAX", "NVIDIA"). */
+  providerName?: string;
+  custom?: { name: string; baseUrl: string; compat: 'openai' | 'anthropic'; model: string };
+  /** Give up on the server after this long and use the local forge. */
+  timeoutMs?: number;
+  /** Injectable for tests. */
+  fetchImpl?: typeof fetch;
 }
+
+/** Server can take several model calls + retries; never leave the UI spinning forever. */
+export const FORGE_CLIENT_TIMEOUT_MS = 120_000;
 
 export class ForgeError extends Error {}
 
@@ -126,7 +139,9 @@ export function localForge(used: UsedFingerprint[], brief = ''): TowerForgeResul
   const usedNames = new Set(used.map((u) => u.name.toLowerCase()));
 
   const rule = BRIEF_RULES.find((r) => r.match.test(brief));
-  const shape = PROJECTILE_SHAPES.find((s) => !usedShapes.has(s)) ?? 'orb';
+  let shape: string = PROJECTILE_SHAPES.find((s) => !usedShapes.has(s)) ?? 'orb';
+  // Every built-in silhouette taken: suffix one so it is still new.
+  for (let i = 2; usedShapes.has(shape) && i < 500; i++) shape = `${PROJECTILE_SHAPES[i % PROJECTILE_SHAPES.length]}-${i}`;
 
   let damageType = rule ? rule.type : 'exotic';
   if (usedTypes.has(damageType)) {
@@ -198,45 +213,82 @@ export interface ForgeResult {
 
 export type TowerForgeResult = ForgeResult;
 
-/** Ask the server to forge a tower. Throws ForgeError on a hard failure. */
+/** True when the server answer has the fields normalise() needs. */
+export function isUsableTower(raw: unknown): boolean {
+  if (!raw || typeof raw !== 'object') return false;
+  const t = raw as Record<string, unknown>;
+  return typeof t.name === 'string' && t.name.trim().length > 0 && typeof t.damageType === 'string' && t.damageType.trim().length > 0;
+}
+
+/** Ask the server to forge a tower. Falls back to the local forge on any failure
+ *  except the caller's own abort. */
 export async function forgeTower(opts: ForgeOptions): Promise<ForgeResult> {
+  const doFetch = opts.fetchImpl ?? fetch;
+  const ctrl = new AbortController();
+  const timeoutMs = opts.timeoutMs ?? FORGE_CLIENT_TIMEOUT_MS;
+  let timedOut = false;
+  const timer = setTimeout(() => {
+    timedOut = true;
+    ctrl.abort();
+  }, timeoutMs);
+  const onAbort = () => ctrl.abort();
+  opts.signal?.addEventListener('abort', onAbort, { once: true });
+  const who = opts.providerName || 'THE AI';
   try {
-    const res = await fetch('/api/forge', {
+    const res = await doFetch('/api/forge', {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
         ...(opts.apiKey ? { 'x-api-key': opts.apiKey } : {}),
       },
-      body: JSON.stringify({ used: opts.used, model: opts.model, brief: opts.brief ?? '' }),
-      signal: opts.signal,
+      body: JSON.stringify({
+        used: opts.used,
+        model: opts.model,
+        brief: opts.brief ?? '',
+        provider: opts.provider,
+        custom: opts.provider === 'custom' ? opts.custom : undefined,
+      }),
+      signal: ctrl.signal,
     });
     if (!res.ok) {
       let detail = '';
+      let kind = '';
       try {
         const data = await res.json();
         detail = String(data?.error ?? '');
+        kind = String(data?.kind ?? '');
       } catch {
         detail = `HTTP ${res.status}`;
       }
-      throw new ForgeError(classify(detail, res.status));
+      throw new ForgeError(classify(detail, res.status, kind, who));
     }
     const data = await res.json();
+    if (!isUsableTower(data?.tower)) throw new ForgeError(`${who} SENT A BROKEN DESIGN`);
     const spec = normalise(data.tower, opts.used);
     return { spec, source: 'ai' };
   } catch (err) {
-    if (err instanceof DOMException && err.name === 'AbortError') throw err;
-    const reason = err instanceof ForgeError ? err.message : 'THE FORGE IS UNREACHABLE';
+    if (opts.signal?.aborted) throw err;
+    let reason = 'THE FORGE IS UNREACHABLE';
+    if (err instanceof ForgeError) reason = err.message;
+    else if (timedOut) reason = `${who} TIMED OUT`;
     return { ...localForge(opts.used, opts.brief ?? ''), reason };
+  } finally {
+    clearTimeout(timer);
+    opts.signal?.removeEventListener('abort', onAbort);
   }
 }
 
 /** Turn a server error into something a player can act on. */
-function classify(detail: string, status: number): string {
+export function classify(detail: string, status: number, kind = '', who = 'MINIMAX'): string {
   const text = detail.toLowerCase();
-  if (status === 429 || text.includes('429') || text.includes('limit') || text.includes('quota')) {
-    return 'MINIMAX QUOTA REACHED';
+  if (kind === 'nokey' || status === 503) return 'NO API KEY ON THE SERVER';
+  if (kind === 'auth' || status === 401) return `${who} REJECTED THE API KEY`;
+  if (kind === 'config' || status === 400) return 'CHECK THE PROVIDER SETTINGS';
+  if (kind === 'quota' || kind === 'rate' || status === 429 || text.includes('429') || text.includes('quota')) {
+    return `${who} QUOTA REACHED`;
   }
-  if (status === 502 || text.includes('minimax call failed')) return 'MINIMAX IS DOWN';
-  if (status === 503) return 'NO API KEY ON THE SERVER';
+  if (kind === 'timeout' || status === 504) return `${who} TIMED OUT`;
+  if (kind === 'invalid' || status === 422) return `${who} SENT A BROKEN DESIGN`;
+  if (status === 502 || text.includes('call failed')) return `${who} IS DOWN`;
   return 'THE FORGE IS UNREACHABLE';
 }

@@ -118,7 +118,7 @@
 
           <div class="menu-foot">
             <span>BEST <b id="menu-best">0</b></span>
-            <span id="menu-key">MINIMAX: CHECKING…</span>
+            <span id="menu-key">AI FORGE: CHECKING…</span>
           </div>
         </div>
         <div class="band band-bottom"></div>
@@ -130,8 +130,8 @@
           <div class="hazard-stripes"></div>
           <h2>FORGE NEW TOWER</h2>
           <p class="modal-sub">
-            The MiniMax forge invents a device that has never existed here: new damage type, new
-            projectile silhouette, new colour, new impact.
+            The AI forge invents a device that has never existed here: new damage type, new
+            projectile silhouette, new colour, new impact. Pick the AI provider in Settings.
           </p>
           <label class="forge-field">
             <span>WHAT DO YOU WANT IT TO DO?</span>
@@ -178,18 +178,53 @@
               </select>
             </label>
             <label class="row">
-              <span>FORGE MODEL</span>
-              <select id="set-model">
-                <option value="MiniMax-M3.1-Flash">MiniMax-M3.1-Flash</option>
-                <option value="MiniMax-M2.7">MiniMax-M2.7</option>
-                <option value="MiniMax-M3">MiniMax-M3</option>
-                <option value="MiniMax-M2.7-highspeed">MiniMax-M2.7-highspeed</option>
-              </select>
+              <span>AI PROVIDER</span>
+              <select id="set-provider"></select>
             </label>
             <label class="row">
-              <span>MINIMAX API KEY</span>
-              <input id="set-key" type="password" placeholder="server key is used when blank" />
+              <span>FORGE MODEL</span>
+              <input id="set-model" list="set-model-list" autocomplete="off" spellcheck="false" placeholder="model id" />
+              <datalist id="set-model-list"></datalist>
             </label>
+            <label class="row row-key">
+              <span>API KEY <em id="set-key-hint" class="key-hint"></em></span>
+              <!-- textarea, no maxlength: some keys (Reflection AI) are ~3x a normal key -->
+              <textarea
+                id="set-key"
+                rows="2"
+                autocomplete="off"
+                autocapitalize="off"
+                spellcheck="false"
+                placeholder="server key is used when blank"
+              ></textarea>
+            </label>
+            <div id="custom-provider" class="custom-provider hidden">
+              <h3>CUSTOM PROVIDER</h3>
+              <p class="cp-help">Don&rsquo;t know the endpoint? Press <b>SEARCH</b> and type the name of the AI service.
+                It looks the endpoint up and works out if it is OpenAI- or Anthropic-compatible. Check the fields, then SAVE.</p>
+              <label class="row">
+                <span>NAME</span>
+                <input id="cp-name" autocomplete="off" placeholder="e.g. OpenAI" />
+              </label>
+              <label class="row">
+                <span>BASE URL</span>
+                <input id="cp-url" type="url" autocomplete="off" spellcheck="false" placeholder="https://api.example.com/v1" />
+              </label>
+              <label class="row">
+                <span>COMPATIBILITY</span>
+                <select id="cp-compat">
+                  <option value="openai">OpenAI-compatible (/chat/completions)</option>
+                  <option value="anthropic">Anthropic-compatible (/v1/messages)</option>
+                </select>
+              </label>
+              <div class="cp-actions">
+                <button id="cp-search" class="mbtn" type="button">&#128269; SEARCH</button>
+              </div>
+            </div>
+            <div class="cp-actions">
+              <button id="set-test" class="mbtn" type="button">TEST CONNECTION</button>
+            </div>
+            <div id="cp-result" class="cp-result"></div>
           </div>
           <div class="balance-block">
             <h3>BALANCE · 5% POWER RULE</h3>

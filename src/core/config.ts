@@ -65,6 +65,9 @@ export const FORGE_COST = 180;
 /** How many AI towers may be forged per run. */
 export const FORGE_LIMIT = 12;
 
+/** How an octopus gets along the road. */
+export type CreepMovement = 'walk' | 'leap' | 'fly';
+
 /** Enemy archetypes: ratio of wave spawns and per-creep multipliers. */
 export interface CreepTier {
   id: string;
@@ -75,13 +78,80 @@ export interface CreepTier {
   color: number;
   scale: number;
   label: string;
+  /** First wave this creep can appear in (it then ramps in over 3 waves). */
+  minWave: number;
+  movement: CreepMovement;
+  /** Shield bubble strength as a share of max HP (absorbs damage first). */
+  shield: number;
+  /** Creeps spawned per wave slot (a swarm fills one slot with several fry). */
+  group: number;
+  /** Kill gold multiplier (keeps swarms and bosses honest). */
+  goldMult: number;
+  /** Lives lost when it escapes. */
+  leakCost: number;
+  /** Boss creeps only appear as the finale of a round, never from the random pick. */
+  boss?: boolean;
+  /** One-line description for the "new foe" toast. */
+  blurb: string;
 }
 
+const tier = (t: Partial<CreepTier> & Pick<CreepTier, 'id' | 'label' | 'color'>): CreepTier => ({
+  weight: 0,
+  hpMult: 1,
+  speedMult: 1,
+  armor: 0,
+  scale: 1,
+  minWave: 1,
+  movement: 'walk',
+  shield: 0,
+  group: 1,
+  goldMult: 1,
+  leakCost: 1,
+  blurb: '',
+  ...t,
+});
+
+/**
+ * The octopus roster. Index order is stable for the first three (older saves
+ * stored the index); new saves store the id.
+ *
+ * Flying creeps hover over the road: ground-only towers (Flame Vent, mines,
+ * slam effects) and dynamite cannot touch them - see canHitFlying().
+ */
 export const CREEP_TIERS: CreepTier[] = [
-  { id: 'grunt', weight: 0.62, hpMult: 1.0, speedMult: 1.0, armor: 0, color: 0x9b6ad6, scale: 1.0, label: 'Drifter' },
-  { id: 'runner', weight: 0.2, hpMult: 0.62, speedMult: 1.42, armor: 0, color: 0xe05fa8, scale: 0.82, label: 'Skitter' },
-  { id: 'tank', weight: 0.18, hpMult: 1.85, speedMult: 0.78, armor: 5, color: 0x3f7fd4, scale: 1.28, label: 'Bulwark' },
+  tier({ id: 'grunt', weight: 0.5, color: 0x9b6ad6, label: 'Drifter', blurb: 'Plain purple octopus.' }),
+  tier({ id: 'runner', weight: 0.17, hpMult: 0.62, speedMult: 1.42, color: 0xe05fa8, scale: 0.82, label: 'Skitter', blurb: 'Small and quick.' }),
+  tier({ id: 'tank', weight: 0.14, hpMult: 1.85, speedMult: 0.78, armor: 5, color: 0x3f7fd4, scale: 1.28, label: 'Bulwark', blurb: 'Armoured and slow.' }),
+  tier({
+    id: 'leaper', weight: 0.12, hpMult: 1.15, speedMult: 1.05, color: 0x6fdc3c, scale: 1.18, label: 'Hopper',
+    minWave: 3, movement: 'leap', blurb: 'Big green octopus that leaps down the road like a frog.',
+  }),
+  tier({
+    id: 'flyer', weight: 0.1, hpMult: 0.8, speedMult: 1.12, color: 0x2fd6c8, scale: 0.92, label: 'Glider',
+    minWave: 4, movement: 'fly', blurb: 'Winged - flame vents and dynamite cannot reach it.',
+  }),
+  tier({
+    id: 'shielded', weight: 0.1, hpMult: 0.85, speedMult: 0.95, color: 0xff9a2e, label: 'Bubbler',
+    minWave: 5, shield: 0.6, blurb: 'Shield bubble soaks damage before its HP. EMP and shred crack it fast.',
+  }),
+  tier({
+    id: 'swarm', weight: 0.08, hpMult: 0.3, speedMult: 1.55, color: 0xffe14d, scale: 0.55, label: 'Fry',
+    minWave: 6, group: 3, goldMult: 0.4, blurb: 'Tiny fast fry that arrive in threes.',
+  }),
+  tier({
+    id: 'skyguard', weight: 0.06, hpMult: 0.9, speedMult: 1.0, color: 0xb57bff, scale: 1.0, label: 'Sky Warden',
+    minWave: 9, movement: 'fly', shield: 0.45, goldMult: 1.4, blurb: 'Flying AND shielded.',
+  }),
+  tier({
+    id: 'boss', weight: 0, hpMult: 6, speedMult: 0.62, armor: 8, color: 0xd6304f, scale: 1.9, label: 'Kraken',
+    minWave: 10, shield: 0.25, goldMult: 5, leakCost: 5, boss: true, blurb: 'Round boss. Costs 5 lives if it escapes.',
+  }),
 ];
+
+/** Index of a creep tier by id (-1 when unknown). */
+export function tierIndexOf(id: string): number {
+  return CREEP_TIERS.findIndex((t) => t.id === id);
+}
 
 /** Total run lives lost per leak depends on the creep tier. */
 export const LEAK_COST = 1;

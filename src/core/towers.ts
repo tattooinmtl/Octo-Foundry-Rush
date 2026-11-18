@@ -8,7 +8,7 @@ import type { ProjectileSystem } from './projectiles';
 import type { Effects } from './effects';
 import type { AudioEngine } from './audio';
 import { buildTowerVisual, type TowerVisual } from './geo';
-import type { TowerSpec } from './towerDefs';
+import { canHitFlying, type TowerSpec } from './towerDefs';
 
 export interface TowerCtx {
   enemies: Enemy[];
@@ -104,12 +104,19 @@ export class Tower {
     this.visual.accent.emissiveIntensity = 1.3 + this.fireFlash * 3.2;
   }
 
+  /** Flame vents, mines and slams work on the ground only. */
+  get hitsFlying(): boolean {
+    return canHitFlying(this.spec);
+  }
+
   private findTarget(enemies: Enemy[]): Enemy | null {
     let best: Enemy | null = null;
     let bestProgress = -Infinity;
     const r2 = this.spec.range * this.spec.range;
+    const air = this.hitsFlying;
     for (const e of enemies) {
       if (!e.alive) continue;
+      if (e.flying && !air) continue;
       const dx = e.position.x - this.position.x;
       const dz = e.position.z - this.position.z;
       if (dx * dx + dz * dz > r2) continue;
@@ -136,7 +143,7 @@ export class Tower {
       );
       let touched = 0;
       for (const e of ctx.enemies) {
-        if (!e.alive) continue;
+        if (!e.alive || e.flying) continue;
         const to = e.position.clone().sub(this.position);
         to.y = 0;
         const dist = to.length();
@@ -159,7 +166,7 @@ export class Tower {
       ctx.effects.beam(origin, end, 0xffffff, 0.12, 0.016);
       ctx.effects.flash(target.position.clone().setY(0.35), this.spec.color, 0.7, 0.2);
       for (const e of ctx.enemies) {
-        if (!e.alive) continue;
+        if (!e.alive || (e.flying && !this.hitsFlying)) continue;
         const rel = e.position.clone().sub(origin);
         const along = rel.dot(dir);
         if (along < 0 || along > this.spec.range) continue;
@@ -183,7 +190,7 @@ export class Tower {
         current.takeDamage(this.damage, 'chain');
         hitIds.add(current);
         const next = ctx.enemies
-          .filter((e) => e.alive && !hitIds.has(e) && e.position.distanceTo(current!.position) < 4.4)
+          .filter((e) => e.alive && !hitIds.has(e) && (!e.flying || this.hitsFlying) && e.position.distanceTo(current!.position) < 4.4)
           .sort((a, b) => a.position.distanceTo(current!.position) - b.position.distanceTo(current!.position))[0];
         from = to;
         current = next ?? null;

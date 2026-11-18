@@ -3,12 +3,17 @@
   "version": "1.0.0",
   "private": true,
   "type": "module",
-  "description": "OCTO FOUNDRY - mobile-first Three.js tower defense with MiniMax-AI-forged towers",
+  "description": "OCTO FOUNDRY - mobile-first Three.js tower defense with AI-forged towers (MiniMax, NVIDIA, Reflection AI, Agnes AI or any OpenAI/Anthropic-compatible provider)",
   "scripts": {
     "dev": "node server/index.mjs --dev",
     "build": "vite build",
     "start": "node server/index.mjs",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "lint": "tsc --noEmit && node --check server/index.mjs && node --check server/forge-core.mjs && node --check server/llm-client.mjs && node --check server/endpoint-finder.mjs && node --check shared/providers.mjs && node --check scripts/find-endpoint.mjs",
+    "test": "npm run test:game && npm run test:server",
+    "test:game": "node --import ./scripts/register-ts.mjs scripts/path-test.ts && node --import ./scripts/register-ts.mjs scripts/balance-test.ts && node --import ./scripts/register-ts.mjs scripts/forge-test.ts && node --import ./scripts/register-ts.mjs scripts/enemy-test.ts && node --import ./scripts/register-ts.mjs scripts/save-test.ts && node --import ./scripts/register-ts.mjs scripts/settings-test.ts",
+    "test:server": "node scripts/server-test.mjs",
+    "find-endpoint": "node scripts/find-endpoint.mjs"
   },
   "dependencies": {
     "dotenv": "^18.0.10",

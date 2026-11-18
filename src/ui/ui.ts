@@ -6,7 +6,15 @@
  */
 
 import { game } from '../core/game';
-import { PRESETS, type TowerSpec } from '../core/towerDefs';
+import { PRESETS, canHitFlying, type TowerSpec } from '../core/towerDefs';
+import { activeModel, providerShortName } from '../core/settings';
+import {
+  CUSTOM_PROVIDER_ID,
+  PROVIDERS,
+  cleanApiKey,
+  providerById,
+  validateApiKey,
+} from '../../shared/providers.mjs';
 import { balanceTable, roundOf, waveInRound, WAVES_PER_ROUND } from '../core/balance';
 import { audio } from '../core/audio';
 import { FORGE_COST, FORGE_LIMIT, WEAPONS, type WeaponId } from '../core/config';
@@ -19,6 +27,10 @@ const $ = <T extends HTMLElement = HTMLElement>(id: string): T => {
 };
 
 const hex = (c: number) => `#${c.toString(16).padStart(6, '0')}`;
+/** Escape text that came from an AI model or the network before it goes into innerHTML. */
+const esc = (v: unknown) =>
+  String(v ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[c] as string);
+const airTag = (spec: Pick<TowerSpec, 'projectileShape' | 'effect'>) => (canHitFlying(spec) ? 'HITS AIR' : 'GROUND ONLY');
 const presetPrice = (p: (typeof PRESETS)[number]) => Math.max(60, Math.round((p.damage * p.fireRate * p.burst * 10) / 5) * 5);
 
 /** What a tower tile builds: a preset, the held forged tower, or the forge. */
@@ -92,9 +104,11 @@ export class UI {
       }
       if (game.loadRun()) {
         this.enterGame();
-        this.toast('RUN RESTORED');
+        this.buildTowerGrid();
+        this.toast(game.waveActive ? `RUN RESTORED · WAVE ${game.wave} IN PROGRESS` : 'RUN RESTORED');
       } else {
-        this.toast('SAVE CORRUPT');
+        audio.ui('error');
+        this.toast(`SAVE COULD NOT BE LOADED · ${game.lastLoadError.toUpperCase()}`);
       }
     });
 
@@ -142,7 +156,7 @@ export class UI {
     });
 
     $('pause-quit').addEventListener('click', () => {
-      game.saveRun();
+      if (!game.saveRun()) this.toast('COULD NOT SAVE (STORAGE BLOCKED?)');
       game.quitToMenu();
       this.pausedModal.classList.add('hidden');
       this.toMenu();
@@ -170,8 +184,12 @@ export class UI {
       this.settingsModal.classList.add('hidden');
       audio.ui('back');
     });
+    $('set-provider').addEventListener('change', () => this.switchProvider());
+    $('set-key').addEventListener('input', () => this.updateKeyHint());
+    $('cp-search').addEventListener('click', () => void this.searchProvider());
+    $('set-test').addEventListener('click', () => void this.testProvider());
     $('set-save').addEventListener('click', () => {
-      this.applySettingsUi();
+      if (!this.applySettingsUi()) return;
       game.applySettings();
       this.settingsModal.classList.add('hidden');
       this.toast('SETTINGS SAVED');
@@ -203,15 +221,14 @@ export class UI {
   private async checkApi(): Promise<void> {
     const el = $('menu-key');
     try {
-      const res = await fetch('/api/health');
+      const res = await fetch('/api/health', { signal: AbortSignal.timeout(8000) });
       const data = await res.json();
-      if (data?.keyPresent) {
-        el.textContent = `MINIMAX: READY · ${data.model}`;
-      } else {
-        el.textContent = 'MINIMAX: NO KEY (SETTINGS)';
-      }
+      const who = providerShortName(game.settings);
+      const id = game.settings.provider;
+      const keyed = !!game.settings.apiKeys[id] || !!data?.keys?.[id];
+      el.textContent = keyed ? `${who}: READY · ${activeModel(game.settings)}` : `${who}: NO KEY (SETTINGS)`;
     } catch {
-      el.textContent = 'MINIMAX: SERVER OFFLINE';
+      el.textContent = 'AI FORGE: SERVER OFFLINE';
     }
   }
 
@@ -276,7 +293,7 @@ export class UI {
           name: p.name.toUpperCase(),
           color: p.color,
           price: () => presetPrice(p),
-          info: `<b style="color:${hex(p.color)}">${p.name.toUpperCase()}</b> · ${p.blurb}<br><em>DPS ${dps.toFixed(1)} · RANGE ${p.range.toFixed(1)} · ${p.effect.toUpperCase()}</em>`,
+          info: `<b style="color:${hex(p.color)}">${p.name.toUpperCase()}</b> · ${p.blurb}<br><em>DPS ${dps.toFixed(1)} · RANGE ${p.range.toFixed(1)} · ${p.effect.toUpperCase()} · ${airTag(p)}</em>`,
         },
       );
     }
@@ -287,12 +304,12 @@ export class UI {
         { kind: 'pending' },
         {
           ico: 'forge',
-          name: spec.name.toUpperCase(),
+          name: esc(spec.name.toUpperCase()),
           color: spec.color,
           price: () => spec.price,
           cls: 'pending',
           badge: 'READY',
-          info: `<b style="color:${hex(spec.color)}">${spec.name.toUpperCase()}</b> · forged and waiting for a pad.<br><em>DPS ${spec.dps.toFixed(1)} · ${spec.projectileShape.toUpperCase()}</em>`,
+          info: `<b style="color:${hex(spec.color)}">${esc(spec.name.toUpperCase())}</b> · forged and waiting for a pad.<br><em>DPS ${spec.dps.toFixed(1)} · ${esc(spec.projectileShape.toUpperCase())} · ${airTag(spec)}</em>`,
         },
       );
     }
@@ -545,10 +562,10 @@ export class UI {
         <span class="tile-ico">${icon(icoName)}</span>
         <div class="sel-meta">
           <span class="sel-level">${stars}</span>
-          <span class="sel-stats"><em>DPS <b>${tower.dps.toFixed(1)}</b></em><em>DMG <b>${tower.damage.toFixed(1)}</b></em><em>${spec.effect.toUpperCase()}</em></span>
+          <span class="sel-stats"><em>DPS <b>${tower.dps.toFixed(1)}</b></em><em>DMG <b>${tower.damage.toFixed(1)}</b></em><em>${spec.effect.toUpperCase()}</em><em>${airTag(spec)}</em></span>
         </div>
       </div>
-      <p class="sel-desc">${spec.mechanic}</p>
+      <p class="sel-desc">${esc(spec.mechanic)}</p>
       <div class="sel-actions"></div>`;
     const actions = body.querySelector('.sel-actions') as HTMLElement;
     if (tower.level < 3) {
@@ -606,7 +623,7 @@ export class UI {
       this.forgeStatus.innerHTML = `
         <div class="gear"></div>
         <div class="forge-lines">
-          <span>&gt; QUERYING MINIMAX…</span><br />
+          <span>&gt; QUERYING ${esc(providerShortName(game.settings))}…</span><br />
           <span>&gt; CHECKING NOVELTY…</span><br />
           <span>&gt; FORGING GEOMETRY…</span>
         </div>`;
@@ -637,13 +654,13 @@ export class UI {
     const brief = this.forgePrompt.value.trim();
     this.forgeResult.classList.remove('hidden');
     this.forgeResult.innerHTML = `
-      <h3>${spec.name.toUpperCase()}</h3>
-      ${brief ? `<p><i>Your brief:</i> ${brief}</p>` : ''}
-      ${fallbackReason ? `<p style="color:#ff9a2e"><i>Offline:</i> ${fallbackReason} — this design was generated on the device instead.</p>` : ''}
-      <p><b>${spec.damageType.toUpperCase()}</b> damage · ${spec.effect.toUpperCase()} · ${spec.projectileShape.toUpperCase()} projectile</p>
-      <p>${spec.mechanic}</p>
-      <p><i>Impact:</i> ${spec.impact}</p>
-      <p><i>Sound:</i> ${spec.sound}</p>
+      <h3>${esc(spec.name.toUpperCase())}</h3>
+      ${brief ? `<p><i>Your brief:</i> ${esc(brief)}</p>` : ''}
+      ${fallbackReason ? `<p style="color:#ff9a2e"><i>Offline:</i> ${esc(fallbackReason)} — this design was generated on the device instead.</p>` : ''}
+      <p><b>${esc(spec.damageType.toUpperCase())}</b> damage · ${esc(spec.effect.toUpperCase())} · ${esc(spec.projectileShape.toUpperCase())} projectile · ${airTag(spec)}</p>
+      <p>${esc(spec.mechanic)}</p>
+      <p><i>Impact:</i> ${esc(spec.impact)}</p>
+      <p><i>Sound:</i> ${esc(spec.sound)}</p>
       <div class="fr-stats">
         <span>DPS ${spec.dps.toFixed(1)}</span>
         <span>DMG ${spec.damage.toFixed(1)}</span>
@@ -664,21 +681,221 @@ export class UI {
   /* Settings                                                          */
   /* ---------------------------------------------------------------- */
 
+  /* Working copy of the provider fields while the settings panel is open,
+     so switching providers back and forth does not lose what was typed. */
+  private draftModels: Record<string, string> = {};
+  private draftKeys: Record<string, string> = {};
+  private draftProvider = '';
+
   private refreshSettingsUi(): void {
     $<HTMLInputElement>('set-master').value = String(game.settings.master);
     $<HTMLInputElement>('set-sfx').value = String(game.settings.sfx);
     $<HTMLSelectElement>('set-quality').value = game.settings.quality;
-    $<HTMLSelectElement>('set-model').value = game.settings.model;
-    $<HTMLInputElement>('set-key').value = game.settings.apiKey;
+
+    const sel = $<HTMLSelectElement>('set-provider');
+    sel.innerHTML = [
+      ...PROVIDERS.map((p) => `<option value="${esc(p.id)}">${esc(p.label)}</option>`),
+      `<option value="${CUSTOM_PROVIDER_ID}">Custom provider…</option>`,
+    ].join('');
+    this.draftModels = { ...game.settings.models, [CUSTOM_PROVIDER_ID]: game.settings.custom.model };
+    this.draftKeys = { ...game.settings.apiKeys };
+    this.draftProvider = game.settings.provider;
+    sel.value = game.settings.provider;
+    $<HTMLInputElement>('cp-name').value = game.settings.custom.name;
+    $<HTMLInputElement>('cp-url').value = game.settings.custom.baseUrl;
+    $<HTMLSelectElement>('cp-compat').value = game.settings.custom.compat;
+    $('cp-result').innerHTML = '';
+    this.showProviderFields(game.settings.provider);
     this.renderBalance();
   }
 
-  private applySettingsUi(): void {
+  /** Fill model/key/custom fields for one provider. */
+  private showProviderFields(id: string): void {
+    const preset = providerById(id);
+    const isCustom = id === CUSTOM_PROVIDER_ID;
+    $('custom-provider').classList.toggle('hidden', !isCustom);
+    const list = $('set-model-list');
+    list.innerHTML = (preset?.models ?? []).map((m) => `<option value="${esc(m)}"></option>`).join('');
+    const model = $<HTMLInputElement>('set-model');
+    model.value = this.draftModels[id] ?? preset?.defaultModel ?? '';
+    model.placeholder = isCustom ? 'model id from the provider docs' : preset?.defaultModel ?? '';
+    $<HTMLTextAreaElement>('set-key').value = this.draftKeys[id] ?? '';
+    $<HTMLTextAreaElement>('set-key').placeholder = preset
+      ? `server key (${preset.envKey}) is used when blank`
+      : 'server key (CUSTOM_API_KEY) is used when blank';
+    this.updateKeyHint();
+  }
+
+  /** Remember the fields of the provider being left, then show the new one. */
+  private switchProvider(): void {
+    const prev = this.draftProvider;
+    this.draftModels[prev] = $<HTMLInputElement>('set-model').value.trim();
+    this.draftKeys[prev] = cleanApiKey($<HTMLTextAreaElement>('set-key').value);
+    this.draftProvider = $<HTMLSelectElement>('set-provider').value;
+    this.showProviderFields(this.draftProvider);
+    $('cp-result').innerHTML = '';
+  }
+
+  /** Show the key length so a very long key (Reflection) is visibly kept whole. */
+  private updateKeyHint(): void {
+    const key = cleanApiKey($<HTMLTextAreaElement>('set-key').value);
+    const preset = providerById(this.draftProvider);
+    const long = preset?.longKey ? ' · long keys are fine, paste it all' : '';
+    $('set-key-hint').textContent = key ? `${key.length} chars${long}` : preset?.longKey ? 'long keys are fine' : '';
+  }
+
+  /** Validate and store the panel. Returns false (and keeps the panel open) on a problem. */
+  private applySettingsUi(): boolean {
+    const provider = $<HTMLSelectElement>('set-provider').value;
+    const keyCheck = validateApiKey($<HTMLTextAreaElement>('set-key').value);
+    if (!keyCheck.ok) {
+      this.toast(`API KEY: ${keyCheck.problem.toUpperCase()}`);
+      audio.ui('error');
+      return false;
+    }
+    const model = $<HTMLInputElement>('set-model').value.trim();
+    const custom = {
+      name: $<HTMLInputElement>('cp-name').value.trim().slice(0, 60),
+      baseUrl: $<HTMLInputElement>('cp-url').value.trim(),
+      compat: ($<HTMLSelectElement>('cp-compat').value === 'anthropic' ? 'anthropic' : 'openai') as 'openai' | 'anthropic',
+      model: provider === CUSTOM_PROVIDER_ID ? model : this.draftModels[CUSTOM_PROVIDER_ID] ?? game.settings.custom.model,
+    };
+    if (provider === CUSTOM_PROVIDER_ID) {
+      if (!/^https?:\/\/[^\s]+$/i.test(custom.baseUrl)) {
+        this.toast('CUSTOM PROVIDER NEEDS A BASE URL (TRY SEARCH)');
+        audio.ui('error');
+        return false;
+      }
+      if (!custom.model) {
+        this.toast('CUSTOM PROVIDER NEEDS A MODEL NAME');
+        audio.ui('error');
+        return false;
+      }
+    }
+    this.draftModels[provider] = model;
+    this.draftKeys[provider] = keyCheck.key;
+
     game.settings.master = Number($<HTMLInputElement>('set-master').value);
     game.settings.sfx = Number($<HTMLInputElement>('set-sfx').value);
     game.settings.quality = $<HTMLSelectElement>('set-quality').value as 'low' | 'medium' | 'high';
-    game.settings.model = $<HTMLSelectElement>('set-model').value;
-    game.settings.apiKey = $<HTMLInputElement>('set-key').value.trim();
+    game.settings.provider = provider;
+    for (const p of PROVIDERS) {
+      const m = (this.draftModels[p.id] ?? '').trim();
+      game.settings.models[p.id] = m || p.defaultModel;
+    }
+    game.settings.apiKeys = Object.fromEntries(Object.entries(this.draftKeys).filter(([, v]) => !!v));
+    game.settings.custom = custom;
+    void this.checkApi();
+    return true;
+  }
+
+  private setResult(html: string): void {
+    $('cp-result').innerHTML = html;
+  }
+
+  /**
+   * SEARCH: ask for the service name, look the endpoint up (built-in table,
+   * then web search on the server) and pre-fill the custom form for review.
+   */
+  private async searchProvider(): Promise<void> {
+    const nameEl = $<HTMLInputElement>('cp-name');
+    const name = window.prompt('Which AI service are you looking for? (e.g. OpenAI, Groq, Mistral)', nameEl.value.trim());
+    if (!name || !name.trim()) return;
+    const btn = $<HTMLButtonElement>('cp-search');
+    btn.disabled = true;
+    this.setResult(`<p class="cp-busy">SEARCHING FOR <b>${esc(name.toUpperCase())}</b> ENDPOINT…</p>`);
+    try {
+      const res = await fetch(`/api/provider-lookup?name=${encodeURIComponent(name.trim())}`, { signal: AbortSignal.timeout(45000) });
+      const data = await res.json().catch(() => ({ ok: false, error: `HTTP ${res.status}` }));
+      if (!data?.ok) {
+        this.setResult(`<p class="cp-bad">${esc(data?.error ?? 'Nothing found.')} You can still fill the form by hand.</p>`);
+        return;
+      }
+      this.applyLookup(data, name.trim());
+    } catch {
+      this.setResult('<p class="cp-bad">Search failed (server offline or timed out). Fill the form by hand.</p>');
+    } finally {
+      btn.disabled = false;
+    }
+  }
+
+  private applyLookup(data: any, typedName: string): void {
+    $<HTMLInputElement>('cp-name').value = String(data.name || typedName).slice(0, 60);
+    $<HTMLInputElement>('cp-url').value = String(data.baseUrl ?? '');
+    $<HTMLSelectElement>('cp-compat').value = data.compat === 'anthropic' ? 'anthropic' : 'openai';
+    const model = $<HTMLInputElement>('set-model');
+    if (data.model && !model.value.trim()) model.value = String(data.model);
+    const pct = Math.round(Number(data.confidence ?? 0) * 100);
+    const src = data.source === 'known' ? 'BUILT-IN TABLE' : 'WEB SEARCH';
+    const links = (Array.isArray(data.sources) ? data.sources : [])
+      .slice(0, 3)
+      .map((u: string) => `<a href="${esc(u)}" target="_blank" rel="noopener noreferrer">${esc(u.replace(/^https?:\/\//, '').slice(0, 60))}</a>`)
+      .join('<br>');
+    const alts = (Array.isArray(data.candidates) ? data.candidates : []).slice(1, 4);
+    this.setResult(`
+      <p class="cp-good">FOUND VIA ${src} · ${pct}% SURE${data.verified ? ' · VERIFIED' : ''}</p>
+      <p><b>${esc(data.baseUrl)}</b> · ${data.compat === 'anthropic' ? 'Anthropic' : 'OpenAI'}-compatible</p>
+      <p class="cp-note">${esc(data.notes ?? '')} Review the fields above, add the model and key, then press SAVE.</p>
+      ${links ? `<p class="cp-src">${links}</p>` : ''}
+      ${alts.length ? `<p class="cp-note">Other candidates:</p><div class="cp-alts">${alts
+        .map((c: any, i: number) => `<button type="button" class="mbtn cp-alt" data-i="${i}">${esc(c.baseUrl)} · ${c.compat === 'anthropic' ? 'ANTHROPIC' : 'OPENAI'}</button>`)
+        .join('')}</div>` : ''}`);
+    $('cp-result')
+      .querySelectorAll<HTMLButtonElement>('.cp-alt')
+      .forEach((b) =>
+        b.addEventListener('click', () => {
+          const c = alts[Number(b.dataset.i)];
+          $<HTMLInputElement>('cp-url').value = String(c.baseUrl);
+          $<HTMLSelectElement>('cp-compat').value = c.compat === 'anthropic' ? 'anthropic' : 'openai';
+        }),
+      );
+  }
+
+  /** TEST CONNECTION: probe the endpoint and, if a key is available, send a tiny prompt. */
+  private async testProvider(): Promise<void> {
+    const provider = $<HTMLSelectElement>('set-provider').value;
+    const keyCheck = validateApiKey($<HTMLTextAreaElement>('set-key').value);
+    if (!keyCheck.ok) {
+      this.setResult(`<p class="cp-bad">API key: ${esc(keyCheck.problem)}</p>`);
+      return;
+    }
+    const btn = $<HTMLButtonElement>('set-test');
+    btn.disabled = true;
+    this.setResult('<p class="cp-busy">TESTING…</p>');
+    try {
+      const res = await fetch('/api/provider-test', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', ...(keyCheck.key ? { 'x-api-key': keyCheck.key } : {}) },
+        body: JSON.stringify({
+          provider,
+          model: $<HTMLInputElement>('set-model').value.trim(),
+          custom: {
+            name: $<HTMLInputElement>('cp-name').value.trim(),
+            baseUrl: $<HTMLInputElement>('cp-url').value.trim(),
+            compat: $<HTMLSelectElement>('cp-compat').value,
+            model: $<HTMLInputElement>('set-model').value.trim(),
+          },
+        }),
+        signal: AbortSignal.timeout(40000),
+      });
+      const data = await res.json();
+      if (!data.ok) {
+        this.setResult(`<p class="cp-bad">${esc(data.error)}</p>`);
+        return;
+      }
+      const probe = data.probe?.reachable ? `endpoint answered (HTTP ${data.probe.status})` : 'endpoint did not answer GET /models (some providers do not expose it)';
+      const chat = !data.keyPresent
+        ? 'no key to test with - paste one or set it on the server'
+        : data.chat?.ok
+          ? `model replied: “${esc(data.chat.sample)}”`
+          : `chat failed: ${esc(data.chat?.error ?? 'unknown')}`;
+      const cls = data.chat?.ok ? 'cp-good' : data.keyPresent ? 'cp-bad' : 'cp-note';
+      this.setResult(`<p class="${cls}">${esc(data.baseUrl)} · ${esc(data.model)}</p><p class="cp-note">${esc(probe)}<br>${chat}</p>`);
+    } catch {
+      this.setResult('<p class="cp-bad">Test failed (server offline or timed out).</p>');
+    } finally {
+      btn.disabled = false;
+    }
   }
 
   private renderBalance(): void {

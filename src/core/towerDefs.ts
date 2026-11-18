@@ -195,3 +195,17 @@ export function presetFingerprints(): { name: string; damageType: string; projec
     projectileShape: p.projectileShape,
   }));
 }
+
+/** Silhouettes that only work along the ground (flame cones, mines). */
+export const GROUND_ONLY_SHAPES = ['plume', 'mine'] as const;
+/** Effects that only work along the ground (a slam hits the floor). */
+export const GROUND_ONLY_EFFECTS: EffectId[] = ['slam'];
+
+/**
+ * Can this tower hit flying octopuses? Flame vents, mines and slams act on
+ * the ground, so flyers drift over them; everything else shoots into the air.
+ */
+export function canHitFlying(spec: Pick<TowerSpec, 'projectileShape' | 'effect'>): boolean {
+  if ((GROUND_ONLY_SHAPES as readonly string[]).includes(spec.projectileShape)) return false;
+  return !GROUND_ONLY_EFFECTS.includes(spec.effect);
+}

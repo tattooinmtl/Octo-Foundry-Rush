@@ -27,9 +27,11 @@ import {
   FREEZE_SECONDS,
   HELLFIRE_SECONDS,
   HELLFIRE_DPS_MULT,
+  CREEP_TIERS,
+  tierIndexOf,
   type WeaponId,
 } from './config';
-import { planWave, playerDps, pickTier, isRoundStart, roundOf, waveInRound, ROUND_REFUND, type WavePlan } from './balance';
+import { planWave, playerDps, buildSpawnList, isRoundStart, roundOf, ROUND_REFUND, type WavePlan } from './balance';
 import { PRESETS, type TowerSpec } from './towerDefs';
 import { generatePath, isPathCell, sampleAt, type GeneratedPath } from './path';
 import { Enemy } from './enemies';
@@ -41,9 +43,12 @@ import { ElectricPortal } from './portals';
 import { Targeter, OrbitalLaser, DeepFreeze, Hellfire, type Strike, type StrikeHooks } from './weapons';
 import { concreteTexture, hazardMaterial, hazardTexture, padTexture } from './geo';
 import { fingerprintOf, forgeTower, type UsedFingerprint } from './forge';
+import { CORRUPT_SAVE_KEY, SAVE_KEY, parseSave, presetSpec, roadSeedFor, serializeSave, type SaveData } from './save';
+import { activeApiKey, activeModel, defaultSettings, migrateSettings, providerShortName, type Settings } from './settings';
 
 export type GameState = 'menu' | 'playing' | 'paused' | 'gameover';
 
+/** @deprecated v1 save shape - kept for reference; see save.ts for the current format. */
 export interface RunSnapshot {
   seed: number;
   gold: number;
@@ -53,7 +58,35 @@ export interface RunSnapshot {
   towers: { padId: string; presetId: string; spec?: TowerSpec; level: number }[];
 }
 
-const SAVE_KEY = 'octo-foundry-save-v1';
+/** localStorage that never throws (Safari private mode, quota, disabled storage). */
+const store = {
+  get(key: string): string | null {
+    try {
+      return localStorage.getItem(key);
+    } catch {
+      return null;
+    }
+  },
+  set(key: string, value: string): boolean {
+    try {
+      localStorage.setItem(key, value);
+      return true;
+    } catch {
+      return false;
+    }
+  },
+  remove(key: string): void {
+    try {
+      localStorage.removeItem(key);
+    } catch {
+      /* ignore */
+    }
+  },
+};
+
+const DYNAMITE_BODY_MAT = new THREE.MeshStandardMaterial({ color: 0xb8342a, roughness: 0.6, metalness: 0.1 });
+const DYNAMITE_BLINK_MAT = new THREE.MeshStandardMaterial({ color: 0xffd0c0, emissive: 0x662222, roughness: 0.5 });
+
 const SETTINGS_KEY = 'octo-foundry-settings-v1';
 const BEST_KEY = 'octo-foundry-best-v1';
 
@@ -87,6 +120,10 @@ export class Game {
   wavePlan: WavePlan | null = null;
   waveActive = false;
   spawnQueue: { at: number; tier: number }[] = [];
+  /** Creep kinds already announced this run ("NEW FOE" toast). */
+  private seenKinds = new Set<string>();
+  /** Why the last loadRun() failed, for the UI. */
+  lastLoadError = '';
   waveClock = 0;
   pendingForge: TowerSpec | null = null;
   forgedCount = 0;
@@ -99,14 +136,7 @@ export class Game {
   selectedPadId: string | null = null;
   lastError = '';
 
-  settings = {
-    master: 0.8,
-    sfx: 0.9,
-    muted: false,
-    quality: 'high' as 'low' | 'medium' | 'high',
-    model: 'MiniMax-M3.1-Flash',
-    apiKey: '',
-  };
+  settings: Settings = defaultSettings();
 
   private pads = new Map<string, THREE.Object3D>();
   private towerByPad = new Map<string, Tower>();
@@ -142,7 +172,14 @@ export class Game {
 
   constructor() {
     this.loadSettings();
-    this.best = Number(localStorage.getItem(BEST_KEY) || 0);
+    this.best = Number(store.get(BEST_KEY) || 0) || 0;
+    // Autosave when the phone locks or the tab goes away mid-run.
+    if (typeof document !== 'undefined') {
+      document.addEventListener('visibilitychange', () => {
+        if (document.visibilityState === 'hidden') this.saveRun();
+      });
+      window.addEventListener('pagehide', () => this.saveRun());
+    }
   }
 
   attachUI(ui: Game['ui']): void {
@@ -569,6 +606,7 @@ export class Game {
     this.wavePlan = null;
     this.spawnQueue = [];
     this.waveClock = 0;
+    this.seenKinds.clear();
 
     this.state = 'playing';
     this.nextWaveIn = 6;
@@ -905,14 +943,31 @@ export class Game {
     this.ui?.setForgeBusy(true);
     audio.forgeStart();
 
-    const { spec, source, reason } = await forgeTower({
-      used: this.usedFingerprints(),
-      apiKey: this.settings.apiKey || undefined,
-      model: this.settings.model,
-      brief: brief.trim().slice(0, 240),
-    });
-
-    this.ui?.setForgeBusy(false);
+    const runAtStart = this.runSeed;
+    let result: Awaited<ReturnType<typeof forgeTower>>;
+    try {
+      result = await forgeTower({
+        used: this.usedFingerprints(),
+        apiKey: activeApiKey(this.settings) || undefined,
+        model: activeModel(this.settings) || undefined,
+        provider: this.settings.provider,
+        providerName: providerShortName(this.settings),
+        custom: this.settings.custom,
+        brief: brief.trim().slice(0, 240),
+      });
+    } catch {
+      // Only an abort lands here - give the fee back.
+      this.gold += FORGE_COST;
+      this.forgedCount = Math.max(0, this.forgedCount - 1);
+      this.ui?.setForgeBusy(false);
+      this.ui?.updateHud();
+      return;
+    } finally {
+      this.ui?.setForgeBusy(false);
+    }
+    // The run was quit or restarted while the forge was thinking: drop it.
+    if (this.runSeed !== runAtStart || this.state === 'menu' || this.state === 'gameover') return;
+    const { spec, source, reason } = result;
     audio.forgeDone();
 
     const placed = this.placeTower(spec, padId, true);
@@ -943,15 +998,25 @@ export class Game {
     this.waveActive = true;
     this.waveClock = 0;
 
-    const rand = Math.random;
-    this.spawnQueue = [];
-    for (let i = 0; i < plan.count; i++) {
-      this.spawnQueue.push({ at: i * plan.spawnInterval, tier: pickTier(rand(), this.wave) });
-    }
+    this.spawnQueue = buildSpawnList(plan);
+    this.announceNewKinds(this.spawnQueue.map((s) => s.tier));
 
     this.ui?.waveWarning(this.wave);
     audio.klaxon();
     this.ui?.updateHud();
+  }
+
+  /** Toast the first appearance of each creep kind so the player learns the roster. */
+  private announceNewKinds(tiers: number[]): void {
+    const fresh: string[] = [];
+    for (const i of tiers) {
+      const t = CREEP_TIERS[i];
+      if (!t || this.seenKinds.has(t.id)) continue;
+      this.seenKinds.add(t.id);
+      // The first three are the classic roster - no need to announce them.
+      if (i >= 3) fresh.push(`${t.label.toUpperCase()}: ${t.blurb}`);
+    }
+    if (fresh.length) this.ui?.toast(`NEW FOE · ${fresh.join(' · ')}`);
   }
 
   /**
@@ -970,7 +1035,7 @@ export class Game {
     this.lives = START_LIVES;
     this.roundTowerSpend = 0;
 
-    this.rebuildMap((this.runSeed + roundOf(this.wave) * 104729) >>> 0);
+    this.rebuildMap(roadSeedFor(this.runSeed, this.wave));
 
     this.ui?.toast(`ROUND ${roundOf(this.wave)} · BOARD RESET · +${refund}G REFUND`);
     audio.waveClear();
@@ -1011,9 +1076,9 @@ export class Game {
     }
   }
 
-  private spawnCreep(tierIndex: number): void {
+  private spawnCreep(tierIndex: number): Enemy | null {
     const plan = this.wavePlan;
-    if (!plan) return;
+    if (!plan) return null;
     const enemy = new Enemy(
       this.scene,
       this.path,
@@ -1026,19 +1091,28 @@ export class Game {
         onDeath: (e) => this.onCreepDeath(e),
         onLeak: (e) => this.onCreepLeak(e),
         onVolatile: (e) => this.onVolatile(e),
+        onShieldBreak: (e) => this.onShieldBreak(e),
       },
     );
     this.enemies.push(enemy);
     this.portals[0]?.discharge();
     audio.portalSpawn();
+    return enemy;
+  }
+
+  private onShieldBreak(e: Enemy): void {
+    const at = e.position.clone().setY(0.4 + (e.flying ? 0.8 * e.tier.scale : 0));
+    this.effects.burst(at, 0x8fe8ff, 14, 3.4);
+    this.effects.shockRing(e.position, 0x8fe8ff, 0.9 * e.tier.scale, 0.35);
+    audio.impact('chain');
   }
 
   private onCreepDeath(e: Enemy): void {
     const plan = this.wavePlan;
-    const gold = plan?.killGold ?? 3;
+    const gold = Math.max(1, Math.round((plan?.killGold ?? 3) * e.tier.goldMult));
     this.gold += gold;
-    this.score += 12 + this.wave * 2 + e.tier.hpMult * 6;
-    this.effects.coins(e.position, e.tier.id === 'tank' ? 6 : 3);
+    this.score += Math.round(12 + this.wave * 2 + e.tier.hpMult * 6);
+    this.effects.coins(e.position, e.tier.boss ? 12 : e.tier.id === 'tank' ? 6 : 3);
     this.effects.burst(e.position.clone().setY(0.3), e.tier.color, 12, 3.2);
     audio.death();
     audio.gold();
@@ -1048,7 +1122,7 @@ export class Game {
   }
 
   private onCreepLeak(e: Enemy): void {
-    this.lives -= 1;
+    this.lives -= e.tier.leakCost;
     this.score = Math.max(0, this.score - 25);
     this.effects.burst(e.position.clone().setY(0.4), 0xff3b30, 16, 3.6);
     this.portals[1]?.discharge();
@@ -1074,6 +1148,8 @@ export class Game {
 
   private endRun(): void {
     this.state = 'gameover';
+    // A lost run cannot be resumed.
+    this.clearSave();
     this.saveBest();
     audio.gameOver();
     this.ui?.gameOver();
@@ -1099,10 +1175,7 @@ export class Game {
     this.gold -= this.dynamiteCost;
 
     const group = new THREE.Group();
-    const body = new THREE.Mesh(
-      new THREE.CylinderGeometry(0.13, 0.13, 0.34, 10),
-      new THREE.MeshStandardMaterial({ color: 0xb8342a, roughness: 0.6, metalness: 0.1 }),
-    );
+    const body = new THREE.Mesh(new THREE.CylinderGeometry(0.13, 0.13, 0.34, 10), DYNAMITE_BODY_MAT);
     group.add(body);
     for (let i = 0; i < 4; i++) {
       const stick = new THREE.Mesh(
@@ -1137,16 +1210,16 @@ export class Game {
     for (let i = this.dynamites.length - 1; i >= 0; i--) {
       const d = this.dynamites[i];
       d.fuse -= dt;
+      // Audit fix: this used to allocate a new material every frame and never blink back.
       const blink = Math.sin(d.fuse * 28) > 0;
-      (d.mesh.children[0] as THREE.Mesh).material = blink
-        ? new THREE.MeshStandardMaterial({ color: 0xffd0c0, emissive: 0x662222, roughness: 0.5 })
-        : (d.mesh.children[0] as THREE.Mesh).material;
+      (d.mesh.children[0] as THREE.Mesh).material = blink ? DYNAMITE_BLINK_MAT : DYNAMITE_BODY_MAT;
       if (d.fuse <= 0) {
         this.effects.explosion(d.pos.clone().setY(0.3), 0xffa13d, 1.6);
         audio.explosion();
         this.shake = Math.min(1.2, this.shake + 0.8);
         for (const e of this.enemies) {
-          if (!e.alive) continue;
+          // A charge on the road cannot reach a creep flying over it.
+          if (!e.alive || e.flying) continue;
           const dist = e.position.distanceTo(d.pos);
           if (dist < DYNAMITE_RADIUS) {
             // A charge must kill what it touches: the rim only chips away 35%.
@@ -1246,86 +1319,124 @@ export class Game {
   /* Save / load                                                      */
   /* ---------------------------------------------------------------- */
 
-  saveRun(): void {
-    if (this.state !== 'playing') return;
-    const snap: RunSnapshot = {
-      seed: this.path.seed,
+  /** Can the current run be saved right now? */
+  get canSave(): boolean {
+    return (this.state === 'playing' || this.state === 'paused') && !!this.path;
+  }
+
+  /** Snapshot of the run in the current save format. */
+  snapshotRun(): Omit<SaveData, 'version'> {
+    return {
+      savedAt: Date.now(),
+      runSeed: this.runSeed,
+      pathSeed: this.path.seed,
       gold: this.gold,
       score: this.score,
       wave: this.wave,
       lives: this.lives,
+      roundTowerSpend: this.roundTowerSpend,
+      forgedCount: this.forgedCount,
+      cooldowns: { ...this.cooldowns },
       towers: this.towers.map((t) => ({
         padId: t.padId,
         presetId: t.spec.presetId,
         spec: t.spec.kind === 'ai' ? t.spec : undefined,
         level: t.level,
       })),
+      pendingForge: this.pendingForge,
+      waveActive: this.waveActive,
+      waveClock: this.waveClock,
+      spawnQueue: this.spawnQueue.map((q) => ({ at: q.at, kind: CREEP_TIERS[q.tier]?.id ?? 'grunt' })),
+      enemies: this.enemies.filter((e) => e.alive).map((e) => e.snapshot()),
+      seenKinds: [...this.seenKinds],
     };
-    localStorage.setItem(SAVE_KEY, JSON.stringify(snap));
+  }
+
+  /**
+   * Save the run. Works while playing AND while paused (the pause menu's
+   * MAIN MENU button pauses first - the old guard silently skipped that save).
+   */
+  saveRun(): boolean {
+    if (!this.canSave) return false;
+    return store.set(SAVE_KEY, serializeSave(this.snapshotRun()));
   }
 
   hasSave(): boolean {
-    return !!localStorage.getItem(SAVE_KEY);
+    return !!store.get(SAVE_KEY);
   }
 
+  /** When the stored save was written (0 for v1 saves or none). */
+  saveInfo(): { wave: number; savedAt: number } | null {
+    const parsed = parseSave(store.get(SAVE_KEY));
+    return parsed.ok ? { wave: parsed.data.wave, savedAt: parsed.data.savedAt } : null;
+  }
+
+  /**
+   * Restore the saved run. The save is fully validated BEFORE the current
+   * board is touched, so a corrupt save can never leave a half-built run.
+   * A corrupt save is parked under CORRUPT_SAVE_KEY instead of being lost.
+   */
   loadRun(): boolean {
-    const raw = localStorage.getItem(SAVE_KEY);
-    if (!raw) return false;
-    let snap: RunSnapshot;
-    try {
-      snap = JSON.parse(raw) as RunSnapshot;
-    } catch {
+    this.lastLoadError = '';
+    const raw = store.get(SAVE_KEY);
+    const parsed = parseSave(raw);
+    if (!parsed.ok) {
+      this.lastLoadError = parsed.error;
+      if (raw && parsed.error !== 'no save found') {
+        store.set(CORRUPT_SAVE_KEY, raw);
+        store.remove(SAVE_KEY);
+      }
       return false;
     }
+    const snap = parsed.data;
+
     this.clearBoard();
-    this.path = generatePath(snap.seed);
+    this.runSeed = snap.runSeed;
+    this.path = generatePath(snap.pathSeed);
     this.buildPathMeshes(this.path);
     this.buildPads(this.path);
     this.gold = snap.gold;
     this.score = snap.score;
     this.wave = snap.wave;
     this.lives = snap.lives;
+    this.roundTowerSpend = snap.roundTowerSpend;
+    this.forgedCount = snap.forgedCount;
+    this.cooldowns = { ...snap.cooldowns };
+    this.pendingForge = snap.pendingForge;
+    this.seenKinds = new Set(snap.seenKinds);
     this.speed = 1;
-    this.waveActive = false;
-    this.nextWaveIn = 6;
-    this.pendingForge = null;
-    this.forgedCount = 0;
-    this.wavePlan = snap.wave > 0 ? planWave(snap.wave + 1, this.path.length) : null;
+    this.armedWeapon = null;
+    this.targeter?.hide();
+    this.selectPad(null);
 
     for (const t of snap.towers) {
-      const spec = t.spec
-        ? t.spec
-        : (() => {
-            const p = PRESETS.find((x) => x.presetId === t.presetId);
-            if (!p) return null;
-            const dps = p.damage * p.fireRate * p.burst;
-            return {
-              id: `t-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 7)}`,
-              kind: 'preset' as const,
-              presetId: p.presetId,
-              name: p.name,
-              damageType: p.damageType,
-              effect: p.effect,
-              damage: p.damage,
-              fireRate: p.fireRate,
-              range: p.range,
-              burst: p.burst,
-              projectileShape: p.projectileShape,
-              color: p.color,
-              impact: p.impact,
-              sound: p.sound,
-              mechanic: p.mechanic,
-              price: Math.max(60, Math.round((dps * 10) / 5) * 5),
-              dps,
-            };
-          })();
+      const spec = t.spec ?? presetSpec(t.presetId);
       if (!spec) continue;
       const pad = this.path.pads.find((p) => p.id === t.padId);
-      if (!pad) continue;
+      if (!pad || this.towerByPad.has(t.padId)) continue;
       const tower = new Tower(this.scene, spec, pad.pos.clone().setY(0.06), t.padId);
-      tower.level = t.level;
+      tower.level = Math.min(3, Math.max(1, t.level));
       this.towers.push(tower);
       this.towerByPad.set(t.padId, tower);
+    }
+
+    if (snap.waveActive) {
+      // Resume mid-wave: same plan, live creeps where they were, rest of the queue.
+      this.wavePlan = planWave(snap.wave, this.path.length);
+      this.waveActive = true;
+      this.waveClock = snap.waveClock;
+      this.spawnQueue = snap.spawnQueue.map((q) => ({ at: q.at, tier: Math.max(0, tierIndexOf(q.kind)) }));
+      for (const es of snap.enemies) {
+        const e = this.spawnCreep(Math.max(0, tierIndexOf(es.kind)));
+        e?.restore(es, this.path);
+      }
+      this.nextWaveIn = 0;
+    } else {
+      this.waveActive = false;
+      this.spawnQueue = [];
+      this.waveClock = 0;
+      this.nextWaveIn = 6;
+      this.wavePlan = snap.wave > 0 ? planWave(snap.wave + 1, this.path.length) : null;
     }
 
     this.state = 'playing';
@@ -1334,7 +1445,7 @@ export class Game {
   }
 
   clearSave(): void {
-    localStorage.removeItem(SAVE_KEY);
+    store.remove(SAVE_KEY);
   }
 
   /* ---------------------------------------------------------------- */
@@ -1342,16 +1453,17 @@ export class Game {
   /* ---------------------------------------------------------------- */
 
   saveSettings(): void {
-    localStorage.setItem(SETTINGS_KEY, JSON.stringify(this.settings));
+    store.set(SETTINGS_KEY, JSON.stringify({ ...this.settings, version: 2 }));
   }
 
   private loadSettings(): void {
+    let raw: unknown = null;
     try {
-      const raw = localStorage.getItem(SETTINGS_KEY);
-      if (raw) Object.assign(this.settings, JSON.parse(raw));
+      raw = JSON.parse(store.get(SETTINGS_KEY) || 'null');
     } catch {
-      /* ignore */
+      raw = null;
     }
+    this.settings = migrateSettings(raw);
     audio.setMaster(this.settings.master);
     audio.setSfx(this.settings.sfx);
     audio.setMuted(this.settings.muted);
@@ -1362,8 +1474,10 @@ export class Game {
     audio.setSfx(this.settings.sfx);
     audio.setMuted(this.settings.muted);
     this.saveSettings();
-    this.renderer.setPixelRatio(this.pixelRatio());
-    this.resize();
+    if (this.renderer) {
+      this.renderer.setPixelRatio(this.pixelRatio());
+      this.resize();
+    }
   }
 
   /* ---------------------------------------------------------------- */
@@ -1447,6 +1561,8 @@ export class Game {
           audio.waveClear();
           this.ui?.waveCleared(plan, plan.waveBonus);
           this.nextWaveIn = 12;
+          // Checkpoint between waves.
+          this.saveRun();
         }
         this.ui?.updateHud();
       }

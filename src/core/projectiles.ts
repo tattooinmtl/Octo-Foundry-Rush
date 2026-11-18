@@ -8,7 +8,7 @@ import { alignBetween, type Enemy } from './enemies';
 import { makeProjectileMesh } from './geo';
 import type { Effects } from './effects';
 import type { AudioEngine } from './audio';
-import type { TowerSpec } from './towerDefs';
+import { canHitFlying, type TowerSpec } from './towerDefs';
 
 export interface ProjectileCtx {
   enemies: Enemy[];
@@ -36,6 +36,10 @@ export class Projectile {
   pierceLeft = 0;
   ricochetLeft = 0;
   dead = false;
+  /** Ground-only rounds (mines, slams) pass under flying creeps. */
+  groundOnly = false;
+  /** Creeps this round already hit (a piercing/ricochet round must not re-hit them). */
+  readonly hitSet = new Set<Enemy>();
 
   constructor(
     mesh: THREE.Object3D,
@@ -55,6 +59,11 @@ export class Projectile {
     this.behaviour = behaviour;
     this.originY = pos.y;
     this.arcHeight = behaviour === 'arc' ? 0.9 : 0;
+    this.groundOnly = !canHitFlying(spec);
+    // Audit fix: these were never initialised, so piercing rounds stopped at
+    // the first creep and ricochets could bounce forever.
+    this.pierceLeft = behaviour === 'pierce' || spec.effect === 'pierce' ? 3 : 0;
+    this.ricochetLeft = spec.effect === 'ricochet' ? 3 : 0;
   }
 }
 
@@ -144,6 +153,8 @@ export class ProjectileSystem {
       let hit: Enemy | null = null;
       for (const e of ctx.enemies) {
         if (!e.alive) continue;
+        if (p.groundOnly && e.flying) continue;
+        if (p.hitSet.has(e)) continue;
         const dx = e.position.x - p.pos.x;
         const dz = e.position.z - p.pos.z;
         if (dx * dx + dz * dz < 0.38 * 0.38) {
@@ -170,8 +181,11 @@ export class ProjectileSystem {
     this.list = this.list.filter((x) => x !== p);
   }
 
-  private impact(p: Projectile, hit: Enemy, ctx: ProjectileCtx): void {
-    const { effects, audio } = ctx;
+  private impact(p: Projectile, hit: Enemy, rawCtx: ProjectileCtx): void {
+    const { effects, audio } = rawCtx;
+    // Ground-only blasts cannot reach anything flying overhead.
+    const ctx = p.groundOnly ? { ...rawCtx, enemies: rawCtx.enemies.filter((e) => !e.flying) } : rawCtx;
+    p.hitSet.add(hit);
 
     switch (p.effect) {
       case 'splash': {
@@ -235,10 +249,11 @@ export class ProjectileSystem {
         effects.burst(p.pos, p.color, 5, 2.4);
         audio.impact('splash');
         // Bounce to a new target.
+        p.ricochetLeft -= 1;
         const next = ctx.enemies
-          .filter((e) => e.alive && e !== hit && e.position.distanceTo(p.pos) < 5)
+          .filter((e) => e.alive && e !== hit && !p.hitSet.has(e) && e.position.distanceTo(p.pos) < 5)
           .sort((a, b) => a.position.distanceTo(p.pos) - b.position.distanceTo(p.pos))[0];
-        if (next) {
+        if (next && p.ricochetLeft > 0) {
           p.dir.copy(next.position.clone().sub(p.pos).normalize());
           p.travelled = 0;
           p.life = 0;

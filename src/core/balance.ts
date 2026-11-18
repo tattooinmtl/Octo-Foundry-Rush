@@ -173,17 +173,62 @@ export function balanceTable(pathLength: number, waves = 12): BalanceRow[] {
   return rows;
 }
 
-/** Pick the creep tier for a spawn, weighted, with tanks arriving later. */
+/** How strongly a tier is present at a wave: 0 before minWave, ramping to 1 over 3 waves. */
+export function tierPresence(tierIndex: number, wave: number): number {
+  const t = CREEP_TIERS[tierIndex];
+  if (!t || t.boss) return 0;
+  if (wave < t.minWave) return 0;
+  // Bulwarks used to be rare before wave 4; keep that early-game feel.
+  if (t.id === 'tank' && wave < 4) return 0.3;
+  return Math.min(1, (wave - t.minWave + 1) / 3);
+}
+
+/** Pick the creep tier for a spawn, weighted, with tougher kinds arriving later. */
 export function pickTier(rand: number, wave: number): number {
-  const weights = CREEP_TIERS.map((t, i) => {
-    if (i === 2) return wave < 4 ? t.weight * 0.3 : t.weight;
-    return t.weight;
-  });
+  const weights = CREEP_TIERS.map((t, i) => t.weight * tierPresence(i, wave));
   const total = weights.reduce((a, b) => a + b, 0);
   let r = rand * total;
   for (let i = 0; i < weights.length; i++) {
+    if (weights[i] <= 0) continue;
     r -= weights[i];
     if (r <= 0) return i;
   }
   return 0;
+}
+
+/** Effective HP (body + shield) one wave slot of this tier is worth, in units of hpPerCreep. */
+export function slotHpWeight(tierIndex: number): number {
+  const t = CREEP_TIERS[tierIndex];
+  return t.hpMult * (1 + t.shield) * t.group;
+}
+
+export interface SpawnEntry {
+  /** Seconds after the wave starts. */
+  at: number;
+  tier: number;
+}
+
+/**
+ * Build a wave's spawn list. Swarm slots spawn their fry in a tight cluster,
+ * and the last wave of every round (from wave 10) ends with a Kraken boss,
+ * which replaces enough regular slots to keep the wave's total HP - and so
+ * the 5% power rule - in line.
+ */
+export function buildSpawnList(plan: WavePlan, rand: () => number = Math.random): SpawnEntry[] {
+  const out: SpawnEntry[] = [];
+  const bossIndex = CREEP_TIERS.findIndex((t) => t.boss);
+  const boss = bossIndex >= 0 ? CREEP_TIERS[bossIndex] : null;
+  const bossWave = !!boss && waveInRound(plan.wave) === WAVES_PER_ROUND && plan.wave >= boss.minWave;
+  let slots = plan.count;
+  if (bossWave && boss) slots = Math.max(3, slots - Math.ceil(slotHpWeight(bossIndex) * 0.6));
+
+  for (let i = 0; i < slots; i++) {
+    const tier = pickTier(rand(), plan.wave);
+    const t = CREEP_TIERS[tier];
+    for (let g = 0; g < t.group; g++) {
+      out.push({ at: i * plan.spawnInterval + g * 0.22, tier });
+    }
+  }
+  if (bossWave) out.push({ at: slots * plan.spawnInterval + 0.8, tier: bossIndex });
+  return out.sort((a, b) => a.at - b.at);
 }

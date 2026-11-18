@@ -1,0 +1,236 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta
+      name="viewport"
+      content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover"
+    />
+    <meta name="theme-color" content="#0d1013" />
+    <meta name="mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+    <title>OCTO FOUNDRY — Industrial Tower Defense</title>
+    <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' fill='%230d1013'/%3E%3Cpath d='M16 5l11 20H5z' fill='%23f5c518' stroke='%23141414' stroke-width='2'/%3E%3Crect x='14.6' y='12' width='2.8' height='7' fill='%23141414'/%3E%3Ccircle cx='16' cy='22' r='1.7' fill='%23141414'/%3E%3C/svg%3E" />
+  </head>
+  <body>
+    <div id="app">
+      <div id="stage">
+        <canvas id="scene"></canvas>
+
+        <!-- Red alarm glow around the board edges while a wave is announced -->
+        <div id="alarm" class="hidden"></div>
+
+        <!-- ================= DANGER WARNING ================= -->
+        <div id="warning" class="hidden">
+          <div class="warn-rays"></div>
+          <div class="warn-3d">
+            <div class="warn-tri warn-back"></div>
+            <div class="warn-tri warn-mid"></div>
+            <div class="warn-tri warn-front"><span>!</span></div>
+          </div>
+          <div class="warn-text">
+            <small>INCOMING</small>
+            ROUND <b id="warn-round">1</b> · WAVE <b id="warn-wave">1</b>
+          </div>
+        </div>
+
+        <div id="toast" class="toast"></div>
+      </div>
+
+      <!-- ============ RIGHT SIDE PANEL (always open, never over the board) ============ -->
+      <aside id="console" class="hidden">
+        <div class="side-scroll">
+          <section class="sec sec-status">
+            <div class="stats">
+              <div class="stat gold"><label>GOLD</label><b id="hud-gold">0</b></div>
+              <div class="stat lives"><label>LIVES</label><b id="hud-lives">20</b></div>
+              <div class="stat"><label>WAVE</label><b id="hud-wave">0</b></div>
+              <div class="stat"><label>SCORE</label><b id="hud-score">0</b></div>
+            </div>
+          </section>
+
+          <section class="sec sec-wave" id="wave-panel">
+            <h3><i class="dot"></i>WAVE CONTROL</h3>
+            <div class="wp-row">
+              <b id="wm-wave">R1 · 1/10</b>
+              <span id="wm-timer">NEXT 6s</span>
+            </div>
+            <div class="wm-bar"><div id="wm-fill"></div></div>
+            <div class="wp-power">
+              <label>FIREPOWER vs TARGET</label>
+              <div class="power-track">
+                <div id="power-fill"></div>
+                <div id="power-target"></div>
+              </div>
+              <b id="power-text">0/0</b>
+            </div>
+            <button id="btn-call-wave">CALL WAVE NOW</button>
+          </section>
+
+          <section class="sec sec-towers">
+            <h3><i class="dot"></i>TOWERS <em id="build-hint">TAP A PAD OR A TOWER</em></h3>
+            <div id="tower-grid" class="tile-grid towers"></div>
+            <div id="tower-info" class="tile-info">Hover a tower to see what it does.</div>
+          </section>
+
+          <section class="sec sec-selected hidden" id="sel-panel">
+            <h3><i class="dot"></i><span id="sel-title">TOWER</span><button id="sel-close" aria-label="Close">✕</button></h3>
+            <div id="sel-body"></div>
+          </section>
+
+          <section class="sec sec-weapons">
+            <h3><i class="dot hot"></i>SPECIAL WEAPONS</h3>
+            <div id="weapon-grid" class="tile-grid weapons"></div>
+            <div id="weapon-info" class="tile-info">Arm a weapon, then click the board. Right-click or Esc cancels.</div>
+          </section>
+
+          <section class="sec sec-system">
+            <div class="sys-row">
+              <button id="btn-speed" class="sys" aria-label="Speed"></button>
+              <button id="btn-mute" class="sys" aria-label="Mute"></button>
+              <button id="btn-pause" class="sys" aria-label="Pause"></button>
+              <button id="btn-game-settings" class="sys" aria-label="Settings"></button>
+            </div>
+          </section>
+        </div>
+      </aside>
+
+      <!-- ================= START SCREEN ================= -->
+      <section id="menu" class="screen">
+        <div class="band band-top"></div>
+        <div class="menu-inner">
+          <div class="crest">
+            <svg viewBox="0 0 64 64" class="crest-mark" aria-hidden="true">
+              <path d="M32 4 L58 58 H6 Z" fill="#f5c518" stroke="#141414" stroke-width="4" />
+              <rect x="29" y="22" width="6" height="16" fill="#141414" />
+              <circle cx="32" cy="46" r="4" fill="#141414" />
+            </svg>
+          </div>
+          <h1 class="logo">OCTO<span>FOUNDRY</span></h1>
+          <p class="tagline">INDUSTRIAL TOWER DEFENSE · AI-FORGED ARMAMENT</p>
+
+          <nav class="menu-buttons">
+            <button id="btn-start" class="mbtn primary"><i>▶</i>START RUN</button>
+            <button id="btn-load" class="mbtn"><i>⟲</i>LOAD</button>
+            <button id="btn-settings" class="mbtn"><i>⚙</i>SETTINGS</button>
+          </nav>
+
+          <div class="menu-foot">
+            <span>BEST <b id="menu-best">0</b></span>
+            <span id="menu-key">MINIMAX: CHECKING…</span>
+          </div>
+        </div>
+        <div class="band band-bottom"></div>
+      </section>
+
+      <!-- ================= FORGE MODAL ================= -->
+      <div id="forge" class="modal hidden">
+        <div class="modal-panel">
+          <div class="hazard-stripes"></div>
+          <h2>FORGE NEW TOWER</h2>
+          <p class="modal-sub">
+            The MiniMax forge invents a device that has never existed here: new damage type, new
+            projectile silhouette, new colour, new impact.
+          </p>
+          <label class="forge-field">
+            <span>WHAT DO YOU WANT IT TO DO?</span>
+            <textarea
+              id="forge-prompt"
+              rows="3"
+              maxlength="240"
+              placeholder="e.g. a tower that chains freezing lightning between groups, or one that burns everything in a long line"
+            ></textarea>
+          </label>
+          <p class="forge-hint">The game is paused while you type. Leave it empty and the forge invents its own idea.</p>
+          <div id="forge-status" class="forge-status">
+            <div class="gear"></div>
+            <div class="forge-lines"><span>READY TO FORGE</span></div>
+          </div>
+          <div id="forge-result" class="forge-result hidden"></div>
+          <div class="modal-actions">
+            <button id="forge-go" class="mbtn primary">FORGE · 180G</button>
+            <button id="forge-close" class="mbtn">CLOSE</button>
+          </div>
+        </div>
+      </div>
+
+      <!-- ================= SETTINGS MODAL ================= -->
+      <div id="settings" class="modal hidden">
+        <div class="modal-panel wide">
+          <div class="hazard-stripes"></div>
+          <h2>SETTINGS</h2>
+          <div class="set-grid">
+            <label class="row">
+              <span>MASTER VOLUME</span>
+              <input id="set-master" type="range" min="0" max="1" step="0.05" />
+            </label>
+            <label class="row">
+              <span>EFFECTS VOLUME</span>
+              <input id="set-sfx" type="range" min="0" max="1" step="0.05" />
+            </label>
+            <label class="row">
+              <span>QUALITY</span>
+              <select id="set-quality">
+                <option value="low">LOW (BATTERY)</option>
+                <option value="medium">MEDIUM</option>
+                <option value="high">HIGH</option>
+              </select>
+            </label>
+            <label class="row">
+              <span>FORGE MODEL</span>
+              <select id="set-model">
+                <option value="MiniMax-M3.1-Flash">MiniMax-M3.1-Flash</option>
+                <option value="MiniMax-M2.7">MiniMax-M2.7</option>
+                <option value="MiniMax-M3">MiniMax-M3</option>
+                <option value="MiniMax-M2.7-highspeed">MiniMax-M2.7-highspeed</option>
+              </select>
+            </label>
+            <label class="row">
+              <span>MINIMAX API KEY</span>
+              <input id="set-key" type="password" placeholder="server key is used when blank" />
+            </label>
+          </div>
+          <div class="balance-block">
+            <h3>BALANCE · 5% POWER RULE</h3>
+            <div id="balance-table" class="balance-table"></div>
+          </div>
+          <div class="modal-actions">
+            <button id="set-save" class="mbtn primary">SAVE</button>
+            <button id="set-reset" class="mbtn danger">RESET DATA</button>
+            <button id="set-close" class="mbtn">CLOSE</button>
+          </div>
+        </div>
+      </div>
+
+      <!-- ================= GAME OVER ================= -->
+      <div id="gameover" class="modal hidden">
+        <div class="modal-panel">
+          <div class="hazard-stripes"></div>
+          <h2>FOUNDRY OVERRUN</h2>
+          <div class="go-stats">
+            <div><label>SCORE</label><b id="go-score">0</b></div>
+            <div><label>BEST</label><b id="go-best">0</b></div>
+            <div><label>ROUND</label><b id="go-wave">1</b></div>
+          </div>
+          <div class="modal-actions">
+            <button id="go-restart" class="mbtn primary">RESTART</button>
+            <button id="go-menu" class="mbtn">MAIN MENU</button>
+          </div>
+        </div>
+      </div>
+
+      <div id="paused" class="modal hidden">
+        <div class="modal-panel">
+          <div class="hazard-stripes"></div>
+          <h2>PAUSED</h2>
+          <div class="modal-actions">
+            <button id="pause-resume" class="mbtn primary">RESUME</button>
+            <button id="pause-quit" class="mbtn">MAIN MENU</button>
+          </div>
+        </div>
+      </div>
+    </div>
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>
